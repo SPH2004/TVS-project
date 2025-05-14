@@ -1,0 +1,5 @@
+pychromecast 
+scapy 
+mac-vendor-lookup 
+requests
+netifaces
