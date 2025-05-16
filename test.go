@@ -1,179 +1,168 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
-	"os/exec"
-	"runtime"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
-func getLocalNetwork() (net.IP, *net.IPNet, error) {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return nil, nil, err
-	}
+const (
+	NetworkPrefix  = "192.168.18." // Ajusta a tu red
+	ScanTimeout    = 150 * time.Millisecond
+	RequestTimeout = 1 * time.Second
+	MaxWorkers     = 200
+)
 
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-
-		for _, addr := range addrs {
-			var ip net.IP
-			var network *net.IPNet
-
-			switch v := addr.(type) {
-			case *net.IPNet:
-				ip = v.IP
-				network = v
-			case *net.IPAddr:
-				ip = v.IP
-				network = &net.IPNet{IP: v.IP, Mask: v.IP.DefaultMask()}
-			}
-
-			if ip == nil || ip.IsLoopback() {
-				continue
-			}
-
-			ip = ip.To4()
-			if ip == nil {
-				continue // no es IPv4
-			}
-
-			return ip, network, nil
-		}
-	}
-
-	return nil, nil, fmt.Errorf("no se pudo determinar la red local")
+var commonPorts = []int{
+	8008, 8009, // Chromecast, Android TV
+	7676, 8001, 8002, // Samsung
+	8060,             // Roku
+	3000, 3001, 3002, // LG WebOS
+	5555, 5353, // Fire TV, ADB
 }
 
-func getIPsInNetwork(network *net.IPNet) []net.IP {
-	var ips []net.IP
-	ip := network.IP.Mask(network.Mask)
-
-	for ip := ip.Mask(network.Mask); network.Contains(ip); inc(ip) {
-		ips = append(ips, net.IP{ip[0], ip[1], ip[2], ip[3]})
-	}
-
-	// Eliminar dirección de red y broadcast
-	if len(ips) > 2 {
-		return ips[1 : len(ips)-1]
-	}
-	return ips
+type Device struct {
+	IP     string `json:"ip"`
+	Name   string `json:"name"`
+	Brand  string `json:"brand"`
+	Status string `json:"status"`
 }
 
-func inc(ip net.IP) {
-	for j := len(ip) - 1; j >= 0; j-- {
-		ip[j]++
-		if ip[j] > 0 {
-			break
-		}
-	}
-}
+var (
+	devices sync.Map
+	wg      sync.WaitGroup
+	workers = make(chan struct{}, MaxWorkers)
+)
 
-func scanARP(ip net.IP) (net.HardwareAddr, error) {
-	var cmd *exec.Cmd
+func scanPort(ctx context.Context, ip string, port int) {
+	defer wg.Done()
+	<-workers
 
-	switch runtime.GOOS {
-	case "linux":
-		cmd = exec.Command("arping", "-c", "1", "-I", "eth0", ip.String())
-	case "darwin":
-		cmd = exec.Command("arping", "-c", "1", "-I", "en0", ip.String())
-	case "windows":
-		cmd = exec.Command("arp", "-a", ip.String())
+	select {
+	case <-ctx.Done():
+		return
 	default:
-		return nil, fmt.Errorf("sistema operativo no soportado")
+		address := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
+		conn, err := net.DialTimeout("tcp", address, ScanTimeout)
+		if err != nil {
+			return
+		}
+		conn.Close()
+
+		val, _ := devices.LoadOrStore(ip, &Device{IP: ip})
+		dev := val.(*Device)
+		devices.Store(ip, dev)
+	}
+}
+
+func detectTVType(ip string) *Device {
+	client := http.Client{Timeout: RequestTimeout}
+
+	// Chromecast
+	resp, err := client.Get("http://" + ip + ":8008/setup/eureka_info")
+	if err == nil && resp.StatusCode == 200 {
+		defer resp.Body.Close()
+		var data map[string]interface{}
+		json.NewDecoder(resp.Body).Decode(&data)
+		name, _ := data["name"].(string)
+		return &Device{IP: ip, Brand: "Chromecast", Name: name, Status: "Active"}
 	}
 
-	output, err := cmd.CombinedOutput()
+	// Roku
+	resp, err = client.Get("http://" + ip + ":8060/query/device-info")
+	if err == nil && resp.StatusCode == 200 {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		if strings.Contains(string(body), "<device-info") {
+			return &Device{IP: ip, Brand: "Roku", Name: "Roku TV", Status: "Active"}
+		}
+	}
+
+	// LG WebOS
+	for _, port := range []int{3000, 3001, 3002} {
+		address := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
+		conn, err := net.DialTimeout("tcp", address, ScanTimeout)
+		if err == nil {
+			conn.Close()
+			return &Device{IP: ip, Brand: "LG WebOS", Name: "LG TV", Status: "Active"}
+		}
+	}
+
+	// Samsung
+	for _, port := range []int{7676, 8001, 8002} {
+		address := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
+		conn, err := net.DialTimeout("tcp", address, ScanTimeout)
+		if err == nil {
+			conn.Close()
+			return &Device{IP: ip, Brand: "Samsung", Name: "Samsung TV", Status: "Active"}
+		}
+	}
+
+	// Fire TV / Android (con ADB abierto)
+	conn, err := net.DialTimeout("tcp", ip+":5555", ScanTimeout)
+	if err == nil {
+		conn.Close()
+		return &Device{IP: ip, Brand: "Android/Fire TV", Name: "ADB Device", Status: "Active"}
+	}
+
+	return &Device{IP: ip, Brand: "Unknown", Name: "Smart TV", Status: "Detected"}
+}
+
+func processDevices() []*Device {
+	var tvs []*Device
+	devices.Range(func(_, val any) bool {
+		ip := val.(*Device).IP
+		tv := detectTVType(ip)
+		tvs = append(tvs, tv)
+		return true
+	})
+
+	sort.Slice(tvs, func(i, j int) bool {
+		return tvs[i].IP < tvs[j].IP
+	})
+	return tvs
+}
+
+func exportToJSON(devices []*Device, filename string) error {
+	data, err := json.MarshalIndent(devices, "", "  ")
 	if err != nil {
-		return nil, err
+		return err
 	}
-
-	if runtime.GOOS == "windows" {
-		// Parsear salida de ARP en Windows
-		lines := strings.Split(string(output), "\n")
-		for _, line := range lines {
-			if strings.Contains(line, ip.String()) {
-				parts := strings.Fields(line)
-				if len(parts) >= 2 {
-					mac, err := net.ParseMAC(parts[1])
-					if err == nil {
-						return mac, nil
-					}
-				}
-			}
-		}
-	} else {
-		// Parsear salida de arping en Linux/macOS
-		lines := strings.Split(string(output), "\n")
-		for _, line := range lines {
-			if strings.Contains(line, "Unicast reply from") {
-				parts := strings.Fields(line)
-				for _, part := range parts {
-					if mac, err := net.ParseMAC(part); err == nil {
-						return mac, nil
-					}
-				}
-			}
-		}
-	}
-
-	return nil, fmt.Errorf("no se encontró dirección MAC")
+	return os.WriteFile(filename, data, 0644)
 }
 
 func main() {
-	fmt.Println("Escaneando dispositivos en la red local...")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-	localIP, network, err := getLocalNetwork()
-	if err != nil {
-		fmt.Printf("Error al obtener la red local: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("Tu IP: %s\nRed local: %s\nMáscara: %s\n\n", 
-		localIP, network.IP, net.IP(network.Mask))
-
-	ips := getIPsInNetwork(network)
-	fmt.Printf("Escaneando %d direcciones IP...\n", len(ips))
-
-	var wg sync.WaitGroup
-	var mutex sync.Mutex
-	activeDevices := make(map[string]string)
-
-	concurrencyLimit := 50
-	semaphore := make(chan struct{}, concurrencyLimit)
-
-	for _, ip := range ips {
-		wg.Add(1)
-		semaphore <- struct{}{}
-
-		go func(ip net.IP) {
-			defer wg.Done()
-			defer func() { <-semaphore }()
-
-			mac, err := scanARP(ip)
-			if err == nil {
-				mutex.Lock()
-				activeDevices[ip.String()] = mac.String()
-				mutex.Unlock()
+loop:
+	for i := 1; i <= 254; i++ {
+		ip := fmt.Sprintf("%s%d", NetworkPrefix, i)
+		for _, port := range commonPorts {
+			select {
+			case <-ctx.Done():
+				break loop // Salimos de ambos bucles
+			case workers <- struct{}{}:
+				wg.Add(1)
+				go scanPort(ctx, ip, port)
 			}
-		}(ip)
+		}
 	}
 
 	wg.Wait()
 
-	fmt.Println("\nDispositivos encontrados en la red:")
-	fmt.Println("IP\t\tMAC Address")
-	for ip, mac := range activeDevices {
-		fmt.Printf("%s\t%s\n", ip, mac)
+	tvs := processDevices()
+	if err := exportToJSON(tvs, "tvs_detectados.json"); err != nil {
+		fmt.Println("Error exportando:", err)
+	} else {
+		fmt.Printf("✅ TVs detectadas: %d\n", len(tvs))
 	}
 }

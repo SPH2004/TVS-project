@@ -1,5 +1,4 @@
 pychromecast 
-scapy 
-mac-vendor-lookup 
+subprocess
 requests
-netifaces
+json

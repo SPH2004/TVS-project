@@ -1,0 +1,26 @@
+[
+  {
+    "ip": "192.168.18.125",
+    "name": "Samsung TV",
+    "brand": "Samsung",
+    "status": "Active"
+  },
+  {
+    "ip": "192.168.18.127",
+    "name": "TV 1 PISO",
+    "brand": "Chromecast",
+    "status": "Active"
+  },
+  {
+    "ip": "192.168.18.186",
+    "name": "Tv Piso 4",
+    "brand": "Chromecast",
+    "status": "Active"
+  },
+  {
+    "ip": "192.168.18.21",
+    "name": "TV 3ER PISO ",
+    "brand": "Chromecast",
+    "status": "Active"
+  }
+]

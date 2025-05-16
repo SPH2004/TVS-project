@@ -1,108 +1,130 @@
-import subprocess
+import json
+import logging
 import re
-import socket
+import subprocess
+from datetime import datetime
 import pychromecast
-import netifaces
+from pychromecast.controllers.media import MediaController
+import requests
 
-def get_local_ip():
-    for iface in netifaces.interfaces():
-        addrs = netifaces.ifaddresses(iface)
-        if netifaces.AF_INET in addrs:
-            for addr in addrs[netifaces.AF_INET]:
-                ip = addr['addr']
-                if ip.startswith("192.168.") or ip.startswith("10.") or ip.startswith("172."):
-                    return ip
-    return None
+# Configuración
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+TIMEOUT = 10  # segundos
 
-def scan_network():
-    print("[*] Escaneando la red local...")
-    try:
-        output = subprocess.check_output(['sudo', 'arp-scan', '--localnet']).decode()
-    except Exception as e:
-        print(f"Error al ejecutar arp-scan: {e}")
-        return []
-
-    devices = []
-    for line in output.splitlines():
-        match = re.match(r"(\d+\.\d+\.\d+\.\d+)\s+([0-9A-F:]+)\s+(.+)", line)
-        if match:
-            ip, mac, vendor = match.groups()
-            devices.append({'ip': ip, 'mac': mac, 'vendor': vendor})
-    return devices
-
-def detect_hostname(ip):
-    try:
-        return socket.gethostbyaddr(ip)[0]
-    except:
-        return None
-
-def detect_chromecast():
-    chromecasts, _ = pychromecast.get_chromecasts()
-    tvs = []
-    for cc in chromecasts:
-        info = {
-            'ip': cc.host,
-            'marca': 'Google',
-            'modelo': cc.device.friendly_name,
-            'os': 'Chromecast (Cast OS)',
-            'tipo': 'Smart TV / Dongle'
+class ChromecastScanner:
+    def __init__(self, ip, name):
+        self.ip = ip
+        self.name = name
+        self.data = {
+            "name": name,
+            "ip": ip,
+            "timestamp": datetime.now().isoformat(),
+            "system": {},
+            "network": {},
+            "media": {},
+            "volume": {},
+            "android": {},
+            "raw": {}
         }
-        tvs.append(info)
-    return tvs
 
-def main():
-    print("🎯 Detectando televisores conectados...\n")
-    local_ip = get_local_ip()
-    if not local_ip:
-        print("No se pudo determinar la IP local.")
-        return
+    def scan_with_pychromecast(self):
+        """Extrae datos via pychromecast"""
+        try:
+            cast = pychromecast.Chromecast(self.ip, timeout=TIMEOUT)
+            cast.wait()
 
-    tvs_detected = []
-
-    # Parte 1: Chromecast
-    chromecast_tvs = detect_chromecast()
-    tvs_detected.extend(chromecast_tvs)
-
-    # Parte 2: Escaneo general
-    network_devices = scan_network()
-    for device in network_devices:
-        ip = device['ip']
-        vendor = device['vendor']
-        mac = device['mac']
-        hostname = detect_hostname(ip)
-
-        # Heurística: si el vendor contiene marcas conocidas
-        known_brands = ["LG", "Samsung", "Sony", "Philips", "Panasonic", "TCL", "Hisense", "Sharp", "Roku"]
-        if any(brand in vendor for brand in known_brands):
-            so = "Desconocido"
-            if "LG" in vendor:
-                so = "webOS"
-            elif "Samsung" in vendor:
-                so = "Tizen"
-            elif "Sony" in vendor or "Philips" in vendor:
-                so = "Android TV"
-            elif "Roku" in vendor:
-                so = "Roku OS"
-
-            tvs_detected.append({
-                'ip': ip,
-                'marca': vendor,
-                'modelo': hostname or "Sin nombre",
-                'os': so,
-                'tipo': 'Smart TV'
+            # Información básica
+            self.data["system"].update({
+                "model": cast.model_name,
+                "manufacturer": cast.cast_info.manufacturer,
+                "uuid": str(cast.uuid),
+                "firmware": cast.cast_info.cast_type,
+                "status": cast.status.status_text
             })
 
-    # Mostrar resultados
-    if tvs_detected:
-        print("\n📺 Televisores detectados en la red:\n")
-        for i, tv in enumerate(tvs_detected, 1):
-            print(f"{i}. IP: {tv['ip']}")
-            print(f"   Marca: {tv['marca']}")
-            print(f"   Modelo: {tv['modelo']}")
-            print(f"   Sistema Operativo: {tv['os']}")
-            print(f"   Tipo: {tv['tipo']}\n")
-    else:
-        print("No se detectaron televisores.")
+            # Estado multimedia
+            if cast.media_controller.status:
+                self.data["media"] = {
+                    "content_id": cast.media_controller.status.content_id,
+                    "title": cast.media_controller.status.title,
+                    "duration": cast.media_controller.status.duration,
+                    "player_state": cast.media_controller.status.player_state
+                }
+
+            # Volumen
+            self.data["volume"] = {
+                "level": cast.status.volume_level,
+                "muted": cast.status.volume_muted
+            }
+
+            # Red
+            self.data["network"] = {
+                "connected": cast.socket_client.is_connected,
+                "ssl": cast.socket_client.ssl_enabled
+            }
+
+            cast.disconnect()
+        except Exception as e:
+            self.data["error_pychromecast"] = str(e)
+
+    def scan_with_adb(self):
+        """Extrae datos de Android TV via ADB"""
+        try:
+            # Comandos ADB (requiere adb conectado previamente)
+            adb_commands = {
+                "android_version": "adb shell getprop ro.build.version.release",
+                "model": "adb shell getprop ro.product.model",
+                "installed_apps": "adb shell pm list packages"
+            }
+
+            for key, cmd in adb_commands.items():
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                self.data["android"][key] = result.stdout.strip()
+
+        except Exception as e:
+            self.data["error_adb"] = f"ADB no disponible: {str(e)}"
+
+    def scan_eureka_api(self):
+        """Extrae datos de la API Eureka"""
+        try:
+            response = requests.get(f"http://{self.ip}:8008/setup/eureka_info", timeout=TIMEOUT)
+            if response.status_code == 200:
+                self.data["raw"]["eureka"] = response.json()
+
+                # Procesar datos útiles de Eureka
+                eureka = response.json()
+                self.data["system"].update({
+                    "build_version": eureka.get("build_version"),
+                    "uptime": eureka.get("uptime"),
+                    "hotspot": bool(eureka.get("hotspot_bssid"))
+                })
+        except requests.exceptions.RequestException as e:
+            self.data["error_eureka"] = str(e)
+
+    def get_all_data(self):
+        """Ejecuta todos los scanners"""
+        self.scan_with_pychromecast()
+        self.scan_with_adb()
+        self.scan_eureka_api()
+        return self.data
+
+def main():
+    # Cargar dispositivos desde JSON
+    with open("tvs_detectados.json") as f:
+        devices = [d for d in json.load(f) if d.get("brand", "").lower() in ["chromecast", "androidtv", "googletv"]]
+
+    results = []
+    for device in devices:
+        logger.info(f"Escaneando {device['name']} ({device['ip']})...")
+        scanner = ChromecastScanner(device["ip"], device["name"])
+        results.append(scanner.get_all_data())
+
+    # Guardar reporte completo
+    with open("chromecast_full_report.json", "w") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+
+    logger.info("¡Escaneo completado! Ver 'chromecast_full_report.json'")
 
 if __name__ == "__main__":
     main()
